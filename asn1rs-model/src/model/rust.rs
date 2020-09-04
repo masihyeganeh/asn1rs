@@ -1,5 +1,5 @@
 use crate::model::rust::Field as RustField;
-use crate::model::Sequence;
+use crate::model::ComponentTypeList;
 use crate::model::Type as AsnType;
 use crate::model::{Asn, ChoiceVariant};
 use crate::model::{Charset, Range};
@@ -40,7 +40,7 @@ pub enum RustType {
     String(Size, Charset),
     VecU8(Size),
     BitVec(Size),
-    Vec(Box<RustType>, Size),
+    Vec(Box<RustType>, Size, EncodingOrdering),
     Option(Box<RustType>),
 
     /// Indicates a complex, custom type that is
@@ -168,7 +168,7 @@ impl RustType {
             RustType::String(..) => None,
             RustType::VecU8(_) => None,
             RustType::BitVec(_) => None,
-            RustType::Vec(inner, _size) => inner.integer_range_str(),
+            RustType::Vec(inner, _size, _ordering) => inner.integer_range_str(),
             RustType::Option(inner) => inner.integer_range_str(),
             RustType::Complex(_) => None,
         }
@@ -218,7 +218,12 @@ impl RustType {
             RustType::String(size, charset) => AsnType::String(size, charset),
             RustType::VecU8(size) => AsnType::OctetString(size),
             RustType::BitVec(size) => AsnType::bit_vec_with_size(size),
-            RustType::Vec(inner, size) => AsnType::SequenceOf(Box::new(inner.into_asn()), size),
+            RustType::Vec(inner, size, EncodingOrdering::Keep) => {
+                AsnType::SequenceOf(Box::new(inner.into_asn()), size)
+            }
+            RustType::Vec(inner, size, EncodingOrdering::Sort) => {
+                AsnType::SetOf(Box::new(inner.into_asn()), size)
+            }
             RustType::Option(value) => AsnType::Optional(Box::new(value.into_asn())),
             RustType::Complex(name) => AsnType::TypeReference(name),
         }
@@ -238,8 +243,8 @@ impl RustType {
             RustType::String(..) => matches!(other, RustType::String(..)),
             RustType::VecU8(_) => matches!(other, RustType::VecU8(_)),
             RustType::BitVec(_) => matches!(other, RustType::BitVec(_)),
-            RustType::Vec(inner_a, _size) => {
-                if let RustType::Vec(inner_b, _other_size) = other {
+            RustType::Vec(inner_a, _size, _ordering) => {
+                if let RustType::Vec(inner_b, _other_size, _ordering) = other {
                     inner_a.similar(inner_b)
                 } else {
                     false
@@ -263,9 +268,18 @@ impl RustType {
     }
 }
 
+/// Describes whether the original declaration cares about (re-)ordering the elements or whether
+/// their encoding is to be applied in the order of definition (struct fields) or appearance (vec)
+#[derive(Debug, Clone, Copy, PartialOrd, PartialEq)]
+pub enum EncodingOrdering {
+    Sort,
+    Keep,
+}
+
 #[derive(Debug, Clone, PartialOrd, PartialEq)]
 pub enum Rust {
     Struct {
+        ordering: EncodingOrdering,
         fields: Vec<Field>,
         extension_after: Option<usize>,
     },
@@ -280,8 +294,10 @@ pub enum Rust {
 }
 
 impl Rust {
+    #[cfg(test)]
     pub fn struct_from_fields(fields: Vec<Field>) -> Self {
         Self::Struct {
+            ordering: EncodingOrdering::Keep,
             fields,
             extension_after: None,
         }
@@ -310,7 +326,7 @@ impl ToString for RustType {
             RustType::String(..) => "String",
             RustType::VecU8(_) => "Vec<u8>",
             RustType::BitVec(_) => "BitVec",
-            RustType::Vec(inner, _size) => return format!("Vec<{}>", inner.to_string()),
+            RustType::Vec(inner, _size, _ordering) => return format!("Vec<{}>", inner.to_string()),
             RustType::Option(inner) => return format!("Option<{}>", inner.to_string()),
             RustType::Complex(name) => return name.clone(),
         }
@@ -527,14 +543,30 @@ impl Model<Rust> {
                 defs.push(Definition(name.into(), Rust::tuple_struct_from_type(inner)))
             }
 
-            AsnType::Sequence(Sequence {
+            AsnType::Sequence(ComponentTypeList {
                 fields,
                 extension_after,
             }) => {
-                let fields = Self::asn_fields_to_rust_fields(name, defs, fields);
+                let fields = Self::asn_fields_to_rust_fields(name, defs, &fields[..]);
                 defs.push(Definition(
                     name.into(),
                     Rust::Struct {
+                        ordering: EncodingOrdering::Keep,
+                        fields,
+                        extension_after: *extension_after,
+                    },
+                ));
+            }
+
+            AsnType::Set(ComponentTypeList {
+                fields,
+                extension_after,
+            }) => {
+                let fields = Self::asn_fields_to_rust_fields(name, defs, &fields[..]);
+                defs.push(Definition(
+                    name.into(),
+                    Rust::Struct {
+                        ordering: EncodingOrdering::Sort,
                         fields,
                         extension_after: *extension_after,
                     },
@@ -545,6 +577,16 @@ impl Model<Rust> {
                 let inner = RustType::Vec(
                     Box::new(Self::definition_type_to_rust_type(name, asn, defs)),
                     *size,
+                    EncodingOrdering::Keep,
+                );
+                defs.push(Definition(name.into(), Rust::tuple_struct_from_type(inner)));
+            }
+
+            AsnType::SetOf(asn, size) => {
+                let inner = RustType::Vec(
+                    Box::new(Self::definition_type_to_rust_type(name, asn, defs)),
+                    *size,
+                    EncodingOrdering::Sort,
                 );
                 defs.push(Definition(name.into(), Rust::tuple_struct_from_type(inner)));
             }
@@ -624,6 +666,8 @@ impl Model<Rust> {
             | Type::Optional(_)
             | Type::Sequence(_)
             | Type::SequenceOf(..)
+            | Type::Set(_)
+            | Type::SetOf(..)
             | Type::Enumerated(_)
             | Type::Choice(_)
             | Type::TypeReference(_) => Vec::default(),
@@ -693,8 +737,17 @@ impl Model<Rust> {
             AsnType::SequenceOf(asn, size) => RustType::Vec(
                 Box::new(Self::definition_type_to_rust_type(name, asn, defs)),
                 *size,
+                EncodingOrdering::Keep,
             ),
-            AsnType::Sequence(_) | AsnType::Enumerated(_) | AsnType::Choice(_) => {
+            AsnType::SetOf(asn, size) => RustType::Vec(
+                Box::new(Self::definition_type_to_rust_type(name, asn, defs)),
+                *size,
+                EncodingOrdering::Sort,
+            ),
+            AsnType::Sequence(_)
+            | AsnType::Set(_)
+            | AsnType::Enumerated(_)
+            | AsnType::Choice(_) => {
                 let name = rust_struct_or_enum_name(name);
                 Self::definition_to_rust(&name, asn, defs);
                 RustType::Complex(name)
@@ -847,7 +900,8 @@ mod tests {
                 "Ones".into(),
                 Rust::tuple_struct_from_type(RustType::Vec(
                     Box::new(RustType::U8(Range::inclusive(0, 1))),
-                    Size::Any
+                    Size::Any,
+                    EncodingOrdering::Keep
                 )),
             ),
             model_rust.definitions[0]
@@ -858,9 +912,11 @@ mod tests {
                 Rust::tuple_struct_from_type(RustType::Vec(
                     Box::new(RustType::Vec(
                         Box::new(RustType::U8(Range::inclusive(0, 1))),
-                        Size::Any
+                        Size::Any,
+                        EncodingOrdering::Keep
                     )),
-                    Size::Any
+                    Size::Any,
+                    EncodingOrdering::Keep
                 )),
             ),
             model_rust.definitions[1]
@@ -871,16 +927,22 @@ mod tests {
                 Rust::struct_from_fields(vec![
                     RustField::from_name_type(
                         "also_ones",
-                        RustType::Vec(Box::new(RustType::U8(Range::inclusive(0, 1))), Size::Any),
+                        RustType::Vec(
+                            Box::new(RustType::U8(Range::inclusive(0, 1))),
+                            Size::Any,
+                            EncodingOrdering::Keep
+                        ),
                     ),
                     RustField::from_name_type(
                         "nesteds",
                         RustType::Vec(
                             Box::new(RustType::Vec(
                                 Box::new(RustType::U8(Range::inclusive(0, 1))),
-                                Size::Any
+                                Size::Any,
+                                EncodingOrdering::Keep
                             )),
-                            Size::Any
+                            Size::Any,
+                            EncodingOrdering::Keep
                         ),
                     ),
                     RustField::from_name_type(
@@ -888,9 +950,11 @@ mod tests {
                         RustType::Option(Box::new(RustType::Vec(
                             Box::new(RustType::Vec(
                                 Box::new(RustType::U64(Range::none())),
-                                Size::Any
+                                Size::Any,
+                                EncodingOrdering::Keep
                             )),
-                            Size::Any
+                            Size::Any,
+                            EncodingOrdering::Keep
                         ))),
                     )
                 ]),
@@ -913,7 +977,8 @@ mod tests {
                 "This".into(),
                 Rust::tuple_struct_from_type(RustType::Vec(
                     Box::new(RustType::U8(Range::inclusive(0, 1))),
-                    Size::Any
+                    Size::Any,
+                    EncodingOrdering::Keep
                 )),
             ),
             model_rust.definitions[0]
@@ -924,9 +989,11 @@ mod tests {
                 Rust::tuple_struct_from_type(RustType::Vec(
                     Box::new(RustType::Vec(
                         Box::new(RustType::U8(Range::inclusive(0, 1))),
-                        Size::Any
+                        Size::Any,
+                        EncodingOrdering::Keep
                     )),
-                    Size::Any
+                    Size::Any,
+                    EncodingOrdering::Keep
                 )),
             ),
             model_rust.definitions[1]
@@ -980,13 +1047,18 @@ mod tests {
                     RustField::from_name_type("ones", RustType::U8(Range::inclusive(0, 1))),
                     RustField::from_name_type(
                         "list_ones",
-                        RustType::Vec(Box::new(RustType::U8(Range::inclusive(0, 1))), Size::Any),
+                        RustType::Vec(
+                            Box::new(RustType::U8(Range::inclusive(0, 1))),
+                            Size::Any,
+                            EncodingOrdering::Keep
+                        ),
                     ),
                     RustField::from_name_type(
                         "optional_ones",
                         RustType::Option(Box::new(RustType::Vec(
                             Box::new(RustType::U8(Range::inclusive(0, 1,))),
-                            Size::Any
+                            Size::Any,
+                            EncodingOrdering::Keep
                         ))),
                     ),
                 ]),
@@ -1097,7 +1169,8 @@ mod tests {
                             "NormalList",
                             RustType::Vec(
                                 Box::new(RustType::String(Size::Any, Charset::Utf8)),
-                                Size::Any
+                                Size::Any,
+                                EncodingOrdering::Keep
                             ),
                         ),
                         DataVariant::from_name_type(
@@ -1105,9 +1178,11 @@ mod tests {
                             RustType::Vec(
                                 Box::new(RustType::Vec(
                                     Box::new(RustType::VecU8(Size::Any)),
-                                    Size::Any
+                                    Size::Any,
+                                    EncodingOrdering::Keep
                                 )),
-                                Size::Any
+                                Size::Any,
+                                EncodingOrdering::Keep
                             ),
                         ),
                     ]
@@ -1136,7 +1211,8 @@ mod tests {
                 "TupleTest".into(),
                 Rust::tuple_struct_from_type(RustType::Vec(
                     Box::new(RustType::String(Size::Any, Charset::Utf8)),
-                    Size::Any
+                    Size::Any,
+                    EncodingOrdering::Keep
                 )),
             ),
             model_rust.definitions[0]
@@ -1168,9 +1244,11 @@ mod tests {
                 Rust::tuple_struct_from_type(RustType::Vec(
                     Box::new(RustType::Vec(
                         Box::new(RustType::String(Size::Any, Charset::Utf8)),
-                        Size::Any
+                        Size::Any,
+                        EncodingOrdering::Keep
                     )),
-                    Size::Any
+                    Size::Any,
+                    EncodingOrdering::Keep
                 )),
             ),
             model_rust.definitions[0]
@@ -1202,7 +1280,8 @@ mod tests {
                     "strings",
                     RustType::Option(Box::new(RustType::Vec(
                         Box::new(RustType::String(Size::Any, Charset::Utf8)),
-                        Size::Any
+                        Size::Any,
+                        EncodingOrdering::Keep
                     ))),
                 )]),
             ),
@@ -1234,7 +1313,8 @@ mod tests {
                     "strings",
                     RustType::Vec(
                         Box::new(RustType::String(Size::Any, Charset::Utf8)),
-                        Size::Any
+                        Size::Any,
+                        EncodingOrdering::Keep
                     ),
                 )]),
             ),
@@ -1273,9 +1353,11 @@ mod tests {
                     RustType::Vec(
                         Box::new(RustType::Vec(
                             Box::new(RustType::String(Size::Any, Charset::Utf8)),
-                            Size::Any
+                            Size::Any,
+                            EncodingOrdering::Keep
                         )),
-                        Size::Any
+                        Size::Any,
+                        EncodingOrdering::Keep
                     ),
                 )]),
             ),

@@ -408,6 +408,11 @@ impl Model<Asn> {
                 name,
                 Self::read_sequence_or_sequence_of(iter)?.opt_tagged(tag),
             ))
+        } else if token.eq_text_ignore_ascii_case("SET") {
+            Ok(Definition(
+                name,
+                Self::read_set_or_set_of(iter)?.opt_tagged(tag),
+            ))
         } else if token.eq_text_ignore_ascii_case("ENUMERATED") {
             Ok(Definition(
                 name,
@@ -662,7 +667,21 @@ impl Model<Asn> {
             let _ = Self::next(iter)?;
             Ok(Type::SequenceOf(Box::new(Self::read_role(iter)?), size))
         } else if token.eq_separator('{') {
-            Ok(Type::Sequence(Sequence::try_from(iter)?))
+            Ok(Type::Sequence(ComponentTypeList::try_from(iter)?))
+        } else {
+            Err(Error::unexpected_token(Self::next(iter)?))
+        }
+    }
+
+    fn read_set_or_set_of(iter: &mut Peekable<IntoIter<Token>>) -> Result<Type, Error> {
+        let size = Self::maybe_read_size(iter)?;
+        let token = Self::peek(iter)?;
+
+        if token.eq_text_ignore_ascii_case("OF") {
+            let _ = Self::next(iter)?;
+            Ok(Type::SetOf(Box::new(Self::read_role(iter)?), size))
+        } else if token.eq_separator('{') {
+            Ok(Type::Set(ComponentTypeList::try_from(iter)?))
         } else {
             Err(Error::unexpected_token(Self::next(iter)?))
         }
@@ -917,7 +936,7 @@ impl<T: TagProperty> TagProperty for Field<T> {
 ///     Tag::Private(7),
 /// ]);
 /// ```
-#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Ord, Eq)]
+#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Ord, Eq, Hash)]
 pub enum Tag {
     Universal(usize),
     Application(usize),
@@ -1046,8 +1065,10 @@ pub enum Type {
 
     Optional(Box<Type>),
 
-    Sequence(Sequence),
+    Sequence(ComponentTypeList),
     SequenceOf(Box<Type>, Size),
+    Set(ComponentTypeList),
+    SetOf(Box<Type>, Size),
     Enumerated(Enumerated),
     Choice(Choice),
     TypeReference(String),
@@ -1088,7 +1109,7 @@ impl Type {
     }
 
     pub const fn sequence_from_fields(fields: Vec<Field<Asn>>) -> Self {
-        Self::Sequence(Sequence {
+        Self::Sequence(ComponentTypeList {
             fields,
             extension_after: None,
         })
@@ -1157,13 +1178,14 @@ impl TryFrom<&mut Peekable<IntoIter<Token>>> for BitString {
     }
 }
 
+/// ITU-T X.680 | ISO/IEC 8824-1:2015, Annex L
 #[derive(Debug, Clone, PartialOrd, PartialEq)]
-pub struct Sequence {
+pub struct ComponentTypeList {
     pub fields: Vec<Field<Asn>>,
     pub extension_after: Option<usize>,
 }
 
-impl TryFrom<&mut Peekable<IntoIter<Token>>> for Sequence {
+impl TryFrom<&mut Peekable<IntoIter<Token>>> for ComponentTypeList {
     type Error = Error;
 
     fn try_from(iter: &mut Peekable<IntoIter<Token>>) -> Result<Self, Self::Error> {

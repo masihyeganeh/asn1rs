@@ -58,6 +58,7 @@ impl UperSerializer {
             Rust::Struct {
                 fields,
                 extension_after: _,
+                ordering: _,
             } => {
                 for field in fields.iter() {
                     Self::impl_read_fn_header_for_type(function, field.name(), field.r#type());
@@ -147,7 +148,7 @@ impl UperSerializer {
             RustType::BitVec(_) => {
                 block.line("reader.read_bitstring()?");
             }
-            RustType::Vec(inner, _size) => {
+            RustType::Vec(inner, _size, _ordering) => {
                 block.line("let len = reader.read_length_determinant()?;");
                 block.line("let mut values = Vec::with_capacity(len);");
                 let mut for_block = Block::new("for _ in 0..len");
@@ -322,6 +323,7 @@ impl UperSerializer {
             Rust::Struct {
                 fields,
                 extension_after: _,
+                ordering: _,
             } => {
                 for field in fields.iter() {
                     Self::impl_write_fn_header_for_type(function, field.name(), field.r#type());
@@ -426,7 +428,7 @@ impl UperSerializer {
                     field_name.map_or_else(|| "value".into(), |f| f.with_ref().to_string()),
                 ));
             }
-            RustType::Vec(inner, _size) => {
+            RustType::Vec(inner, _size, _ordering) => {
                 block.line(format!(
                     "writer.write_length_determinant({}.len())?;",
                     field_name

@@ -1,7 +1,8 @@
 use crate::gen::RustCodeGenerator;
-use crate::model::rust::{rust_module_name, DataEnum, Field, PlainEnum};
-use crate::model::{Charset, Definition, Model, Range, Rust, RustType, Size, TagProperty};
+use crate::model::rust::{rust_module_name, DataEnum, EncodingOrdering, Field, PlainEnum};
+use crate::model::{Charset, Definition, Model, Range, Rust, RustType, Size, Tag, TagProperty};
 use codegen::{Block, Impl, Scope};
+use std::collections::HashSet;
 use std::fmt::Display;
 
 pub const CRATE_SYN_PREFIX: &str = "::asn1rs::syn::";
@@ -18,10 +19,17 @@ impl AsnDefWriter {
             Rust::Struct {
                 fields,
                 extension_after: _,
+                ordering,
             } => {
                 scope.raw(&format!(
-                    "type AsnDef{} = {}Sequence<{}>;",
-                    name, CRATE_SYN_PREFIX, name
+                    "type AsnDef{} = {}{}<{}>;",
+                    name,
+                    CRATE_SYN_PREFIX,
+                    match ordering {
+                        EncodingOrdering::Keep => "Sequence",
+                        EncodingOrdering::Sort => "Set",
+                    },
+                    name
                 ));
                 for field in fields {
                     self.write_type_declaration(scope, &name, field.name(), field.r#type());
@@ -84,16 +92,19 @@ impl AsnDefWriter {
             RustType::VecU8(_) => format!("{}OctetString<{}Constraint>", CRATE_SYN_PREFIX, name),
             RustType::BitVec(Size::Any) => format!("{}BitString", CRATE_SYN_PREFIX),
             RustType::BitVec(_) => format!("{}BitString<{}Constraint>", CRATE_SYN_PREFIX, name),
-            RustType::Vec(inner, Size::Any) => format!(
-                "{}SequenceOf<{}>",
+            RustType::Vec(inner, size, ordering) => format!(
+                "{}{}<{}{}>",
                 CRATE_SYN_PREFIX,
-                Self::type_declaration(&*inner, name)
-            ),
-            RustType::Vec(inner, _) => format!(
-                "{}SequenceOf<{}, {}Constraint>",
-                CRATE_SYN_PREFIX,
+                match ordering {
+                    EncodingOrdering::Keep => "SequenceOf",
+                    EncodingOrdering::Sort => "SetOf",
+                },
                 Self::type_declaration(&*inner, name),
-                name
+                if Size::Any != *size {
+                    format!(", {}Constraint", name)
+                } else {
+                    String::default()
+                }
             ),
             RustType::Option(inner) => format!("Option<{}>", Self::type_declaration(&*inner, name)),
             RustType::Complex(inner) => format!("{}Complex<{}>", CRATE_SYN_PREFIX, inner),
@@ -124,6 +135,7 @@ impl AsnDefWriter {
             Rust::Struct {
                 fields,
                 extension_after: _,
+                ordering: _,
             } => {
                 let constants = fields
                     .iter()
@@ -184,9 +196,16 @@ impl AsnDefWriter {
             Rust::Struct {
                 fields,
                 extension_after,
+                ordering,
             } => {
                 self.write_field_constraints(scope, &name, &fields);
-                self.write_sequence_constraint(scope, &name, &fields, *extension_after);
+                self.write_sequence_or_set_constraint(
+                    scope,
+                    &name,
+                    &fields,
+                    *extension_after,
+                    *ordering,
+                );
             }
             Rust::Enum(plain) => {
                 self.write_enumerated_constraint(scope, &name, plain);
@@ -199,7 +218,13 @@ impl AsnDefWriter {
                     constants: constants.to_vec(),
                 }];
                 self.write_field_constraints(scope, &name, &fields[..]);
-                self.write_sequence_constraint(scope, &name, &fields[..], None);
+                self.write_sequence_or_set_constraint(
+                    scope,
+                    &name,
+                    &fields[..],
+                    None,
+                    EncodingOrdering::Keep,
+                );
             }
         }
     }
@@ -280,8 +305,16 @@ impl AsnDefWriter {
             RustType::BitVec(size) => {
                 Self::write_size_constraint("bitstring", scope, constraint_type_name, size)
             }
-            RustType::Vec(inner, size) => {
-                Self::write_size_constraint("sequenceof", scope, constraint_type_name, size);
+            RustType::Vec(inner, size, ordering) => {
+                Self::write_size_constraint(
+                    match ordering {
+                        EncodingOrdering::Keep => "sequenceof",
+                        EncodingOrdering::Sort => "setof",
+                    },
+                    scope,
+                    constraint_type_name,
+                    size,
+                );
                 self.write_field_constraint(
                     scope,
                     name,
@@ -307,18 +340,28 @@ impl AsnDefWriter {
         }
     }
 
-    fn write_sequence_constraint(
+    fn write_sequence_or_set_constraint(
         &self,
         scope: &mut Scope,
         name: &str,
         fields: &[Field],
         extension_after_field: Option<usize>,
+        ordering: EncodingOrdering,
     ) {
-        let mut imp = Impl::new(name);
-        imp.impl_trait(format!("{}sequence::Constraint", CRATE_SYN_PREFIX));
+        let sorted;
+        let (fields, module) = match ordering {
+            EncodingOrdering::Keep => (fields, "sequence"),
+            EncodingOrdering::Sort => {
+                sorted = Self::sort_fields_canonically(fields);
+                (&sorted[..], "set")
+            }
+        };
 
-        self.write_sequence_constraint_read_fn(&mut imp, name, fields);
-        self.write_sequence_constraint_write_fn(&mut imp, name, fields);
+        let mut imp = Impl::new(name);
+        imp.impl_trait(format!("{}{}::Constraint", CRATE_SYN_PREFIX, module));
+
+        self.write_sequence_or_set_constraint_read_fn(&mut imp, name, fields);
+        self.write_sequence_or_set_constraint_write_fn(&mut imp, name, fields);
 
         Self::write_sequence_constraint_insert_consts(
             scope,
@@ -581,7 +624,12 @@ impl AsnDefWriter {
         scope.raw(&lines.join("\n"));
     }
 
-    fn write_sequence_constraint_read_fn(&self, imp: &mut Impl, name: &str, fields: &[Field]) {
+    fn write_sequence_or_set_constraint_read_fn(
+        &self,
+        imp: &mut Impl,
+        name: &str,
+        fields: &[Field],
+    ) {
         imp.new_fn("read_seq")
             .attr("inline")
             .generic(&format!("R: {}Reader", CRATE_SYN_PREFIX))
@@ -604,7 +652,12 @@ impl AsnDefWriter {
             });
     }
 
-    fn write_sequence_constraint_write_fn(&self, imp: &mut Impl, name: &str, fields: &[Field]) {
+    fn write_sequence_or_set_constraint_write_fn(
+        &self,
+        imp: &mut Impl,
+        name: &str,
+        fields: &[Field],
+    ) {
         let body = imp
             .new_fn("write_seq")
             .attr("inline")
@@ -638,12 +691,32 @@ impl AsnDefWriter {
 
         scope.to_string()
     }
+
+    fn sort_fields_canonically(fields: &[Field]) -> Vec<Field> {
+        let mut used_tags = fields.iter().filter_map(|f| f.tag).collect::<HashSet<_>>();
+        let mut counter = 0;
+
+        fields
+            .iter()
+            .map(|field| {
+                let mut field = field.clone();
+                if field.tag.is_none() {
+                    while used_tags.contains(&Tag::ContextSpecific(counter)) {
+                        counter += 1;
+                    }
+                    used_tags.insert(Tag::ContextSpecific(counter));
+                    field.tag = Some(Tag::ContextSpecific(counter));
+                }
+                field
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
 pub mod tests {
     use crate::gen::rust::walker::AsnDefWriter;
-    use crate::model::rust::Field;
+    use crate::model::rust::{EncodingOrdering, Field};
     use crate::model::{Charset, Definition, Model, Rust, RustType, Size};
     use crate::parser::Tokenizer;
     use codegen::Scope;
@@ -669,6 +742,7 @@ pub mod tests {
         Definition(
             String::from("Potato"),
             Rust::Struct {
+                ordering: EncodingOrdering::Keep,
                 fields: vec![
                     Field::from_name_type("name", RustType::String(Size::Any, Charset::Utf8)),
                     Field::from_name_type(
